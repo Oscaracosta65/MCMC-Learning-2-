@@ -2576,7 +2576,7 @@ function fmt(v, n) {
 function escHtml(str) {
     if (str === null || str === undefined) return '';
     str = String(str);
-    var map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '`': '&#96;' };
+    var map = { '&': '\x26amp;', '<': '\x26lt;', '>': '\x26gt;', '"': '\x26quot;', "'": '\x26#39;', '`': '\x26#96;' };
     return str.replace(/[&<>"'`]/g, function (ch) { return map[ch] || ch; });
 }
 
