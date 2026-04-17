@@ -1111,6 +1111,16 @@ if (!function_exists('ensureMcmcSchema')) {
         } catch (\Exception $e) {
             $isSuper = false;
         }
+        $cacheKey = 'mcmc.schema.ok.' . MCMC_MODEL_VERSION;
+        try {
+            $appLocal = JFactory::getApplication();
+            $cachedOk = (int)$appLocal->getUserState($cacheKey, 0);
+            if ($cachedOk === 1) {
+                return $result;
+            }
+        } catch (\Exception $e) {
+            /* Continue without cache if state access fails. */
+        }
 
         $schemaMap = mcmcSchemaDefinitionMap();
         $pending = [];
@@ -1154,6 +1164,7 @@ if (!function_exists('ensureMcmcSchema')) {
         }
 
         if (empty($pending)) {
+            try { JFactory::getApplication()->setUserState($cacheKey, 1); } catch (\Exception $e) {}
             return $result;
         }
 
@@ -1182,6 +1193,8 @@ if (!function_exists('ensureMcmcSchema')) {
 
         if (!empty($result['errors'])) {
             $result['success'] = false;
+        } else {
+            try { JFactory::getApplication()->setUserState($cacheKey, 1); } catch (\Exception $e) {}
         }
         return $result;
     }
@@ -1526,11 +1539,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && JSession::checkToken() && isset($_P
             /* FALLBACK: original 15-column insert (pre-migration schema) */
             $insFallback = $db->getQuery(true)
                 ->insert($db->quoteName('#__user_saved_numbers'))
-                ->columns([
+                ->columns(array_map([$db,'quoteName'], [
                     'user_id','lottery_id','main_numbers','extra_ball_numbers',
                     'source','label','generated_at','date_saved','next_draw_date',
                     'walks','burn_in','laplace_k','decay','chain_len'
-                ])
+                ]))
                 ->values(implode(',', [
                     (int)$currUser->id,
                     $targetLotteryId,
@@ -1624,6 +1637,7 @@ echo 'window.lottoConfig = '     . json_encode([
     'scoreWMain'        => isset($lc['score_weight_main'])  ? (int)$lc['score_weight_main']  : 5,
     'scoreWExtra'       => isset($lc['score_weight_extra']) ? (int)$lc['score_weight_extra'] : 2,
     'gameId'            => $gameIdDb,
+    'csrfTokenName'     => JSession::getFormToken(),
     // lotteryNumericId: the integer lottery_id from #__lotteries for save-form use.
     // Resolved server-side to avoid client-side spoofing.
     'lotteryNumericId'  => (function() use ($db, $gameIdDb) {
@@ -2558,20 +2572,29 @@ function fmt(v, n) {
     return parseFloat(v).toFixed(n);
 }
 
-/* Escape HTML to prevent XSS in innerHTML assignments.
-   Uses split/join instead of regex so that no regex literal containing a quote
-   character can be mangled by Joomla content-security filters, which would cause
-   a "string literal contains an unescaped line break" JS syntax error. */
+/* Escape HTML to prevent XSS in innerHTML assignments. */
 function escHtml(str) {
     if (str === null || str === undefined) return '';
     str = String(str);
-    str = str.split('&').join('&amp;');
-    str = str.split('<').join('&lt;');
-    str = str.split('>').join('&gt;');
-    str = str.split('"').join('&quot;');
-    str = str.split("'").join('&#39;');
-    str = str.split('`').join('&#96;');
-    return str;
+    var map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '`': '&#96;' };
+    return str.replace(/[&<>"'`]/g, function (ch) { return map[ch] || ch; });
+}
+
+/* Resolve Joomla CSRF token field name from server-injected config first,
+   then fallback to hidden-field scan for backward compatibility. */
+function getCsrfTokenName() {
+    var cfg = window.lottoConfig || {};
+    if (cfg.csrfTokenName) {
+        return String(cfg.csrfTokenName);
+    }
+    var tokenEls = document.querySelectorAll('input[type=hidden]');
+    for (var t = 0; t < tokenEls.length; t++) {
+        var tel = tokenEls[t];
+        if (tel.name && tel.name.length === 32 && /^[0-9a-f]{32}$/.test(tel.name)) {
+            return tel.name;
+        }
+    }
+    return '';
 }
 
 /* Build plain object as hash-set from array */
@@ -3400,6 +3423,7 @@ function rerankByFeatures(baseProbs, features, maxN, weights, alpha) {
 
     /* Agreement feature: high base prob = high agreement across models */
     var probMax = Math.max(maxArr(baseProbs), 1e-9);
+    var GAP_PARABOLA_SCALE = 4;
 
     var modified = [];
     for (var b = 0; b < maxN; b++) {
@@ -3416,8 +3440,8 @@ function rerankByFeatures(baseProbs, features, maxN, weights, alpha) {
            - normGap=1.0 (never appeared or extremely old) gets no boost (stale/cold)
            The formula normGap*(1-normGap)*4 is the unit parabola scaled to [0,1],
            peaking at normGap=0.5. The factor 4 ensures the peak value equals 1.0.
-           This models the empirically common 'overdue' effect in lottery data. */
-        var gapScore = normGap * (1 - normGap) * 4; /* x4 scales parabola peak to 1.0 */
+           This is a transparent heuristic for reranking, not a proven causal law. */
+        var gapScore = normGap * (1 - normGap) * GAP_PARABOLA_SCALE;
         var featureScore = weights.freq       * normFreq
                          + weights.gap        * gapScore
                          + weights.momentum   * normMom
@@ -3555,16 +3579,9 @@ function persistLearningState(runType, statePayload) {
         return;
     }
 
-    /* Find Joomla CSRF token */
-    var token = '';
-    var tokenEls = document.querySelectorAll('input[type=hidden]');
-    for (var t = 0; t < tokenEls.length; t++) {
-        var tel = tokenEls[t];
-        if (tel.name && tel.name.length === 32 && /^[0-9a-f]{32}$/.test(tel.name)) {
-            token = tel.name + '=1';
-            break;
-        }
-    }
+    /* Resolve Joomla CSRF token field name */
+    var tokenName = getCsrfTokenName();
+    var token = tokenName ? (tokenName + '=1') : '';
     /* Abort silently if no CSRF token found — the server would reject the request
        anyway. Log to console to aid debugging if Joomla changes its token format. */
     if (!token) {
@@ -4735,19 +4752,13 @@ function savePrediction(mainNums, extraNums, label, generatedAt, walks, burnIn, 
         form.appendChild(inp);
     }
 
-    /* Joomla CSRF token: find by name length=32 AND all hex characters.
-       This is more robust than length alone and matches Joomla's token format.
-       Guard: if no token found, abort the form submit — the server would reject
-       the request with a CSRF error, giving the user a confusing blank response. */
+    /* Joomla CSRF token from server-injected token name with backward-compatible
+       hidden input scan fallback. */
     var tokenFound = false;
-    var tokenEls = document.querySelectorAll('input[type=hidden]');
-    for (var t = 0; t < tokenEls.length; t++) {
-        var tel = tokenEls[t];
-        if (tel.name && tel.name.length === 32 && /^[0-9a-f]{32}$/.test(tel.name)) {
-            addHidden(tel.name, tel.value);
-            tokenFound = true;
-            break;
-        }
+    var tokenName = getCsrfTokenName();
+    if (tokenName) {
+        addHidden(tokenName, '1');
+        tokenFound = true;
     }
     if (!tokenFound) {
         alert('Cannot save: security token not found. Please reload the page and try again.');
